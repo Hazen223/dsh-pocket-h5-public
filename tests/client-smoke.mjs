@@ -40,7 +40,7 @@ const windowStub = {
     },
   },
 }
-runInNewContext(await readFile(bundlePath, 'utf8'), { window: windowStub, console, TextEncoder, TextDecoder })
+runInNewContext(await readFile(bundlePath, 'utf8'), { window: windowStub, console, TextEncoder, TextDecoder, URL, URLSearchParams })
 
 check(definition !== null, 'bundle calls window.__ModuleLoader__.load()')
 check(definition?.id === pkg.name, `factory id equals package name (${pkg.name})`)
@@ -240,7 +240,41 @@ if (typeof summarize === 'function') {
   check(empty.tone === 'error' && empty.title.includes('没有完成'), 'diagnosis: missing payload is handled')
 }
 
-/* ---- 7. generated assets are present and plausible ---- */
+/* ---- 7. login bridge helpers (pure) + bundled wiring ---- */
+const bridgeBannerText = qrTest.bridgeBannerText
+const bridgeCanTarget = qrTest.bridgeCanTarget
+check(typeof bridgeBannerText === 'function', 'client exposes bridge banner text for smoke tests')
+check(typeof bridgeCanTarget === 'function', 'client exposes bridge target guard for smoke tests')
+
+if (typeof bridgeBannerText === 'function' && typeof bridgeCanTarget === 'function') {
+  check(bridgeBannerText(null) === '登录桥未启用', 'bridge: inactive banner text')
+  const activeText = bridgeBannerText({ active: true, source: 'safari', cookieCount: 12 })
+  check(activeText.includes('Safari') && activeText.includes('12'), 'bridge: safari banner reports cookie count')
+  const manualText = bridgeBannerText({ active: true, source: 'manual', cookieCount: 3 })
+  check(manualText.includes('手动 Cookie'), 'bridge: manual banner names the source')
+  check(bridgeCanTarget('http://127.0.0.1:5173/app') === true, 'bridge: http target accepted')
+  check(bridgeCanTarget('https://example.com/') === true, 'bridge: https target accepted')
+  check(bridgeCanTarget('dsh-app://app/pocket-h5/demo.html') === false, 'bridge: dsh-app target rejected')
+  check(bridgeCanTarget('about:blank') === false, 'bridge: about:blank rejected')
+  check(bridgeCanTarget('') === false, 'bridge: empty target rejected')
+}
+
+/* ---- 8. device bezel geometry (user-provided iPhone frame) ---- */
+const bezel = qrTest.bezelMetrics
+check(bezel && typeof bezel === 'object', 'client exposes the device bezel geometry for smoke tests')
+if (bezel) {
+  check(bezel.portrait.screenW === 402 && bezel.portrait.screenH === 874, 'bezel: screen opening is 402x874 logical px')
+  check(Math.abs(bezel.portrait.outerW - 439.3333) < 0.01, `bezel: portrait outer width (${bezel.portrait.outerW})`)
+  check(Math.abs(bezel.portrait.outerH - 905.6667) < 0.01, `bezel: portrait outer height (${bezel.portrait.outerH})`)
+  const right = bezel.portrait.outerW - bezel.portrait.screenX - bezel.portrait.screenW
+  const bottom = bezel.portrait.outerH - bezel.portrait.screenY - bezel.portrait.screenH
+  check(Math.abs(right - 18.6666) < 0.01 && Math.abs(bottom - 15.6667) < 0.01, 'bezel: portrait side/bottom margins')
+  check(bezel.landscape.outerW === bezel.portrait.outerH && bezel.landscape.outerH === bezel.portrait.outerW, 'bezel: landscape outer box is the rotated portrait box')
+  check(bezel.landscape.screenW === 874 && bezel.landscape.screenH === 402, 'bezel: landscape screen opening is rotated')
+  check(bezel.radius > 0, 'bezel: screen corner radius is provided')
+}
+
+/* ---- 9. generated assets are present and plausible ---- */
 const source = await readFile(bundlePath, 'utf8')
 check(source.includes(':host {'), 'generated CSS carries the :host scope')
 check(source.includes('data-pocket-h5-style'), 'panel injects its own shadow-root style tag')
@@ -256,6 +290,36 @@ check(source.includes('id = \'diagnoseButton\''), 'diagnosis button is created i
 check(source.includes('summarizeProbe'), 'diagnosis summarizer is bundled')
 check(source.includes('在系统浏览器打开 H5'), 'external-open button names the system browser')
 check(source.includes('需要登录的页面'), 'help dialog explains login and framing limits')
+check(source.includes("button.id = 'bridgeButton'"), 'login-bridge button is created in the panel')
+check(source.includes('bridgeBanner'), 'login-bridge banner is bundled')
+check(source.includes('function pocketPreviewTarget'), 'bridged preview resolves back to the real target')
+check(source.includes('window.pocketBridge'), 'navigation is bridge-aware (refresh keeps the proxy)')
+check(source.includes('完全磁盘访问'), 'permission guidance for Safari cookies is included')
+check(source.includes('PANEL_THEME_CSS'), 'FlowPilot-style appearance layer is bundled')
+check(source.includes('light-dark('), 'appearance tokens use light-dark() for dark mode')
+check(source.includes('ph-topbar'), 'brand/status/actions are moved into a top bar')
+check(source.includes('grid-template-columns: 300px minmax(0, 1fr)'), 'workspace uses the sidebar + canvas card layout')
+check(source.includes('mountPanelTheme'), 'appearance layer is mounted with the panel')
+check(source.includes('data:image/webp;base64,'), 'device bezel image is inlined into the bundle')
+check(source.includes('POCKET_BEZEL.portrait'), 'device geometry is bezel-based, not a hand-drawn frame')
+check(source.includes('--p-bezel-image'), 'theme layer paints the bezel as the phone background')
+check(source.includes('border-radius: 0 !important'), 'screen is rectangular; the bezel overlay clips the corners')
+check(source.includes('class="status-time"'), 'status bar uses the Apple-standard time element')
+check(source.includes('viewBox="0 0 18 12"'), 'status bar signal icon uses the standard 18x12 geometry')
+check(source.includes('cy="11.4"'), 'status bar Wi-Fi icon uses the standard arcs + dot')
+check(source.includes('21 * state.battery'), 'battery fill width matches the iOS battery body')
+check(source.includes('width: 134px'), 'home indicator uses the standard 134px width')
+check(source.includes('className = \'ph-help\''), 'sidebar explanations are moved into circular ? buttons')
+check(source.includes('.ph-tip'), 'help buttons show a styled hover tooltip')
+check(source.includes("settings-section .setting-hint"), 'secondary hint paragraphs are hidden from the layout')
+check(source.includes('data-tip-from'), 'help tooltips can append live status text')
+check(source.includes('--p-bezel-mask'), 'rectangular page is clipped to the bezel silhouette')
+check(source.includes('POCKET_BEZEL_MASK_LANDSCAPE'), 'landscape silhouette is bundled too')
+check(source.includes('mask-size: 100% 100%'), 'silhouette mask is stretched to the phone box')
+check(source.includes('SF Pro Text'), 'status bar text uses the SF Pro system font stack')
+check(source.includes('ph-right'), 'top bar groups URL + actions on the right edge')
+check(source.includes('flex-direction: row !important'), 'brand mark and name stay on one row')
+check(source.includes('.ph-brand .brand-sub'), 'the redundant H5 preview pill is hidden')
 
 if (failures.length > 0) {
   console.error(`\n${failures.length} client smoke check(s) failed`)

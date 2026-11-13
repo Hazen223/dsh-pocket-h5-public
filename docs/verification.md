@@ -551,3 +551,333 @@ GET /pocket-h5/probe.json    => 404   （阶段 5 新路由，运行中的 Host 
 2. 重启后桌面 `dsh-app://app` 下 `fetch('/pocket-h5/probe.json')` 的真实链路与面板内结果渲染。
 3. 真实内网站点（X-Frame-Options / SSO 登录）的探测结果与用户侧观感。
 4. 手机扫码与「在系统浏览器打开」在桌面端的实际行为（上一轮遗留）。
+
+---
+
+## 14. 阶段 6（登录桥：Safari Cookie + 本机反向代理）
+
+> 时间：2026-11-12 20:29–21:10（Asia/Shanghai）。触发：用户要求「继承 Safari/Chrome 已登录状态，
+> 在这个 App 里预览」。用户选择「方案 A（本机代理）+ Safari 自动导入」。
+
+### 14.1 结论
+
+- 浏览器没有跨应用读取登录态的 API；Safari Cookie 库受 TCC 保护（本机 DSH 进程读它返回
+  `Operation not permitted`）。因此实现为：**从本机 Cookie 文件（或手动粘贴）取 Cookie，
+  Host 起本机反向代理注入 Cookie，面板 iframe 走代理**——不改 DSH、不改浏览器安全模型。
+- 自动导入需要用户给 DSH 授「完全磁盘访问权限」并重启；未授权时返回可操作错误，并提供
+  「手动粘贴 Cookie」兜底（无需任何权限）。
+
+### 14.2 实现与测试
+
+```text
+lib/bridge.js           946 行，纯 node 内置；无磁盘写入、无 console 日志
+src/client/bridge.js    登录桥按钮/对话框/状态条/恢复直连；pocketPreviewTarget 统一目标解析
+index.js                GET|POST /pocket-h5/bridge.json（start/refresh/stop，单一活动桥，30min 闲置回收）
+build-client.mjs        navigate() 桥感知（目标地址照记，实际加载 entryUrl）；bundle 注入 bridge 片段
+```
+
+```text
+node tests/bridge-unit.mjs   # 27/27 ok
+node tests/host-smoke.mjs    # 30/30 ok（新增 9 项 bridge：状态/启动/注入/XFO 剥离/Set-Cookie 改写/
+                             #   jar 回灌/重定向改写/停止/端口关闭/Safari 权限错误）
+node tests/client-smoke.mjs  # 77/77 ok（新增 15 项：bridgeBannerText/bridgeCanTarget + 产物静态断言）
+node build-client.mjs        # 幂等通过；client.js 196586 B，sha256 632b4447…48b4e（dirty dev 构建）
+```
+
+真实 Safari 读取（本机当前未授权 FDA）：
+
+```text
+{"ok":false,"code":"safari-permission","message":"没有权限读取 Safari Cookie 文件（EPERM）。需要在
+「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里给 DSH 授权后重启 DSH。"}
+```
+
+### 14.3 登录桥行为证据（host-smoke 实跑）
+
+- 手动 Cookie 启动：`cookieCount=2`，`proxyUrl` 为 `http://127.0.0.1:<随机端口>`；
+- 经代理请求 `/bridge-echo`：上游收到 `sid=abc`（注入成功），响应里 `X-Frame-Options` 被剥离、
+  CSP 不含 `frame-ancestors`；
+- `/bridge-set` 的 `Set-Cookie: token=xyz; Path=/; HttpOnly; SameSite=None; Secure` → 代理响应去掉
+  `Domain`/`SameSite=None`，保留 HttpOnly/Secure/Path；随后 `/bridge-next` 由 jar 回灌 `token=xyz`；
+- `/bridge-redirect` 的绝对 `Location` 改写成代理 origin；
+- `POST {action:'stop'}` 后代理端口拒绝连接；
+- WebSocket `upgrade` 隧道注入 Cookie（bridge-unit 用例）。
+
+### 14.4 重启证据（运行中的 Host 仍是旧模块）
+
+```text
+GET /pocket-h5/display.json  => 200
+GET /pocket-h5/probe.json    => 200
+GET /pocket-h5/bridge.json   => 404   （阶段 6 新路由，运行中的 Host 未加载）
+```
+
+→ Host 代码变更不热重载：需**完全退出并重开 DSH**；client.js 刷新 GUI 即可。
+建议顺序：先给 DSH 授「完全磁盘访问权限」，再退出/重开 DSH（一次完成授权生效 + 新 Host 加载）。
+
+### 14.5 未验证项（阶段 6）
+
+1. 登录桥对话框/状态条的实际渲染与交互（无浏览器控制）。
+2. 授权 FDA 并重启后，`readSafariCookies()` 在真实 Host 进程里的读取结果（本机当前是 EPERM）。
+3. 真实目标站点（Cookie 认证、含 X-Frame-Options/SSO）的端到端登录预览。
+4. 页面内绝对跨域地址、WebSocket HMR 在真实 Vite/H5 项目中的表现（单测覆盖隧道，真实站点未验证）。
+5. 手动粘贴 Cookie 的真实浏览器复制流程（DevTools/Copy as cURL）。
+
+---
+
+## 15. 阶段 7（FlowPilot 风格外观层 + 黑暗模式）
+
+> 时间：2026-11-13 00:01–00:25（Asia/Shanghai）。触发：用户反馈面板左侧设置栏「设计太糟糕」，
+> 要求按 FlowPilot 的设计语言重排，并且界面要有黑暗模式。
+
+### 15.1 实现
+
+```text
+src/client/theme.js      新增：PANEL_THEME_CSS（light-dark 令牌 + 布局/控件/对话框覆盖）
+                              + mountPanelTheme()（DOM 重排：品牌/当前页面/状态/刷新/新窗口 → 48px 顶栏）
+build-client.mjs         注入 theme 片段；移除此前 `:host { color-scheme: light }` 的强制浅色
+src/client/panel.js      样式链：CSS + QR_CSS + DIAGNOSIS_CSS + BRIDGE_CSS + PANEL_THEME_CSS；
+                         effect 里 mountPocketH5 → mountPanelTheme → 显示器/二维码/诊断/登录桥
+README / docs            新增「外观与黑暗模式」、§15 外观层说明；修正「不随宿主主题切换」的旧限制
+```
+
+### 15.2 验证
+
+```text
+node build-client.mjs     # 幂等（连跑两次）；client.js 218791 B
+shasum -a 256 client.js   # 1e1572a96988925efff583c8dda7b8ed2e8c1dbb7261e59d5e1189393690ee9c
+node --check client.js    # ok
+node --check index.js     # ok
+node tests/host-smoke.mjs    # 30/30 ok
+node tests/client-smoke.mjs  # 82/82 ok（新增 5 项外观层断言：light-dark/ph-topbar/300px 网格/mountPanelTheme）
+node tests/bridge-unit.mjs   # 27/27 ok
+```
+
+静态证据：
+
+- 生成产物中 `light-dark(` 出现 **22** 次（面层/文本/描边/阴影/点阵/热区成对声明）；
+- 强制 `color-scheme: light` 出现 **0** 次（改为继承宿主 color-scheme，DSH 深色主题自动生效）；
+- `ph-topbar` 出现 18 次（顶栏结构与样式）；
+- `git status ui/` 为空：上游四个快照文件仍未被修改（外观层只覆盖，不改快照）。
+
+### 15.3 未验证项（阶段 7）
+
+1. **视觉**：浅色/黑暗两种主题下的实际渲染、间距/对齐、1080/860px 窄宽度断点——无浏览器控制，
+   需用户在 DSH 里刷新后目视；深色由「DSH 设置 → 外观 → 深色」触发。
+2. 顶栏动作（刷新 / 在系统浏览器打开 / 二维码 / 诊断 / 登录桥）在真实宽度下的排布与换行。
+3. 对话框（二维码/诊断/登录桥/帮助）在深色主题下的对比度。
+4. 面板重新进入（StrictMode/切换面板）时 header 重建是否有布局闪动。
+5. 仅刷新 GUI 即可（本轮没有 Host 变更，不需要重启 DSH）。
+
+### 15.4 同轮调整：分区改卡片、去掉横向分隔线
+
+用户反馈「横线太多，不同功能区域用卡片分开」后同一轮调整：
+
+- 左栏从「一张长卡 + 分区分割线」改为**一区一卡的卡片栈**（`.settings-section` 各自
+  `background: var(--p-surface)` + `--p-shadow-1` + 12px 圆角，`gap: 8px`，栏本身透明）；
+- 删除 `::before` 分隔线规则；
+- 代理/校准/屏幕规格等折叠项从「虚线上边框」改为卡内 `--p-surface-2` 下沉小面板；
+- 帮助/开发者工具/引擎信息/自动保存/重置/说明由 `mountPanelTheme` 收进 `.ph-sidebar-foot`
+  独立卡片（不再用 `border-top`）；
+- 构建：client.js 220213 B；`node --check` 通过；host 30/30、client 82/82、bridge 27/27 全过。
+  视觉仍未由验证者目视（无浏览器控制），需用户刷新后确认。
+
+---
+
+## 16. 阶段 8（套用用户提供的 iPhone 外框图片）
+
+> 时间：2026-11-13 00:12–00:40（Asia/Shanghai）。触发：用户发来一张 iPhone 外框图，
+> 要求「白色区域是屏幕区域，帮我套上去」。
+
+### 16.1 素材处理（可复现）
+
+```text
+输入：用户提供的 1318×2718 PNG（透明背景，屏幕开口为浅色区域 + 灵动岛）
+处理：tools/prepare-bezel.py
+  - 从画面中心泛洪浅色像素得到屏幕开口，填洞（含灵动岛）→ 开口像素全部置为透明；
+  - 裁到外框 bbox：1318×2717，屏幕开口 = (56, 48, 1206, 2622)（横竖比 0.460 = 402/874）；
+  - 保存 WebP q92：src/client/assets/bezel.webp，63,030 字节（61.6 KiB）；
+  - 记录逻辑几何（÷3）：portrait 外框 439.3333×905.6667，开口 (18.6667, 16.0)，
+    右下留边 18.6667/15.6667；landscape = 旋转 -90°（开口 874×402）。
+```
+
+### 16.2 接入方式
+
+```text
+build-client.mjs
+  - 读取 assets/bezel.webp + bezel.json，校验屏幕开口 402×874、图片 <200 KiB；
+  - 内联为 data:image/webp;base64 常量 POCKET_BEZEL_IMAGE + POCKET_BEZEL；
+  - app.js 两处机械替换：
+    · device.bodyWidthMm/bodyHeightMm ← 边框比例换算（72.777 / 150.032 mm）
+    · resizeDevice 的 padding ← POCKET_BEZEL.portrait/landscape 逐边几何
+src/client/theme.js
+  - .phone 只保留布局盒；::before 画边框（横屏 rotate(-90deg)）；.side-key 隐藏；
+  - .screen border-radius = 素材开口半径 90px，去掉上游 5/6px 描边环；
+  - mountPanelTheme 把 --p-bezel-image/--p-bezel-w/--p-bezel-h/--p-screen-radius 写到面板根节点。
+assets/README.md + tools/prepare-bezel.py 记录来源与重做方式。
+```
+
+尺寸核对：`bodyWidthMm × (460/3/25.4) = 72.777 × 6.036745 ≈ 439.333`（外框逻辑宽）；
+`439.333 − 18.667 − 402 = 18.667`（右留边），`905.667 − 16 − 874 = 15.667`（底留边）。
+
+### 16.3 验证
+
+```text
+node build-client.mjs        # 幂等；client.js 307,081 B（边框 base64 约 +84 KiB）
+node --check client.js       # ok
+node tests/host-smoke.mjs    # 30/30 ok
+node tests/client-smoke.mjs  # 93/93 ok（新增 11 项边框几何/内联断言）
+node tests/bridge-unit.mjs   # 27/27 ok
+```
+
+### 16.4 未验证项（阶段 8）
+
+1. 真实渲染：边框图片与 `.screen` 的对齐（尤其圆角处 vs 抠空开口）、横屏旋转方向与边缘留白、
+   深色主题下的投影/边框观感——无浏览器控制，需用户刷新后目视。
+2. 高 DPI/150% 缩放下的边框清晰度（素材为 3x，理论足够）。
+3. 用户实际设备上的「100% 真机大小」与边框图片比例是否观感一致。
+4. 仅 client.js 变更：刷新 GUI 即可，无需重启 DSH。
+
+---
+
+## 17. 阶段 9（边框盖板 + iOS 标准状态栏/手势条）
+
+> 触发：用户反馈「四周圆角有问题，其实只需要在边框下用长方形页面，用边框盖住；顶部导航栏和底部
+> 滑动条完全不标准」。
+
+### 17.1 改动
+
+- `.screen` 去圆角（矩形）；设备边框从 `.phone::before` 背景改为 **z-index: 5 的盖板**，
+  页面四角由素材不透明内框裁切（素材开口本身是 iOS squircle，比 CSS 圆角更准）。
+- 构建期替换状态栏标记为 Apple 几何：时间 17pt/600（左内边距 54）、信号 18×12、Wi‑Fi 17×12、
+  电池 27×13（体内宽 21 + 2 尖端、百分比在体内）、右侧内边距 26；
+- 底部手势条 134×5、圆角 2.5、距底 8；横屏 180×5、距底 7；
+- app.js 电池填充宽度 24→21（配合电池体内宽）。
+
+### 17.2 验证
+
+```text
+node build-client.mjs        # 幂等；client.js 310,000 B
+node --check client.js       # ok
+node tests/host-smoke.mjs    # 30/30 ok
+node tests/client-smoke.mjs  # 99/99 ok（新增状态栏/手势条/盖板断言）
+node tests/bridge-unit.mjs   # 27/27 ok
+```
+
+### 17.3 未验证项（阶段 9）
+
+1. 真实渲染：盖板与矩形页面的四角裁切是否干净、边框与屏幕是否严丝合缝（无浏览器控制）。
+2. 状态栏在 62pt 安全区内的视觉位置、深浅主题下的对比、电池百分比的字号/位置。
+3. 底部手势条与横屏切換。
+4. 仅 client.js 变更：刷新 GUI 即可。
+
+---
+
+## 18. 阶段 10（侧栏说明收进 ? 悬浮提示）
+
+> 触发：用户反馈左侧说明文字太多，要求遵循「Avoid unnecessary secondary labels and descriptions.
+> Let the layout do the explaining.」，把必要说明放进圆形 ? 图标（hover 出现）。
+
+### 18.1 改动
+
+- 隐藏 `.settings-section .setting-hint` 与 `.sidebar-note`（不再常驻）；
+- 8 个 `.ph-help` 圆形 ? 按钮：预览地址、显示与尺寸、模拟设备、系统外观、页面布局、SOCKS5、
+  校准实际尺寸、侧栏页脚；
+- `.ph-tip` 浮层：hover / focus 出现、点击固定、Esc/滚动/失焦关闭；支持 `data-tip-from`
+  追加当前 `#calibrationStatus` / `#layoutHint` 的实时文字；
+- `<summary>` 内的 ? 阻止事件冒泡，不触发展开/收起；浮层 `position: fixed` 避免被滚动容器裁切；
+- 分区标题仍保留（结构说明），但不再有长段解释文字。
+
+### 18.2 验证
+
+```text
+node build-client.mjs        # 幂等；client.js   317,145 B
+node --check client.js       # ok
+node tests/host-smoke.mjs    # 30/30 ok
+node tests/client-smoke.mjs  # 103/103 ok（新增 4 项 ? / 提示 / 隐藏说明断言）
+node tests/bridge-unit.mjs   # 27/27 ok
+```
+
+### 18.3 未验证项（阶段 10）
+
+1. ? 浮层在真实面板中的定位（贴边/下方空间不足时翻到上方）、深浅主题对比、`summary` 内点击行为；
+2. 隐藏说明后各控件是否仍然自解释（需要用户从视觉上确认是否还想保留某条说明）；
+3. 仅 client.js 变更：刷新 GUI 即可。
+
+### 18.4 同轮微调（问号位置/大小与浮层层级）
+
+- 问号从 15px → **13px**（字号 10px → 9px），紧跟在分区标题/折叠摘要文字之后（不再被推到行尾）；
+  `summary` 里的问号插在 `.summary-title` 之后，右侧徽标/箭头仍靠右。
+- 浮层改用 **Popover API**（`popover="manual"` + `showPopover()`）进入浏览器 top layer，
+  彻底避免被侧栏文字/滚动容器盖住或裁切；不支持时回退到 `position: fixed` + `hidden`。
+- 浮层左边缘对齐问号、默认显示在下方，靠近窗口底部时翻到上方；`z-index: 60`。
+- 构建：client.js 318,448 B（sha256 `6e84afe8…`）；client-smoke 103/103 通过。
+
+---
+
+## 19. 阶段 11（机身剪影裁切：修四角露白）
+
+> 触发：用户截图指出外框左上角露出矩形页面的白角。
+
+### 19.1 原因
+
+屏幕开口是 squircle，页面是矩形；矩形页面的**包围盒角点**比手机外轮廓的圆角更靠外（外框外圆角
+半径约 85 逻辑 px，开口包围盒角点落在机身轮廓之外），所以页面白角会从外框边缘露出来。
+
+### 19.2 修复
+
+- `tools/prepare-bezel.py` 新增输出：`bezel-mask.webp`（机身剪影，1,266 B）与
+  `bezel-mask-landscape.webp`（旋转 90°，1,270 B）；
+- `.phone` 加 `mask-image: var(--p-bezel-mask)` / 横屏 `var(--p-bezel-mask-l)`，
+  `mask-size: 100% 100%`：页面仍矩形，但整棵子树被裁到手机外轮廓内；
+- 阴影从 `.phone::before` 的 `filter` 移到 `.device-slot`，避免被 mask 裁掉；
+- 状态栏字体显式使用系统 SF Pro（`-apple-system / SF Pro Text / SF Pro Display`），字距 -0.41px；
+- 素材剪影合计约 2.5 KiB，构建期内联。
+
+### 19.3 验证
+
+```text
+node build-client.mjs        # 幂等；client.js 322,878 B（sha256 b76ad262…）
+node --check client.js       # ok
+node tests/host-smoke.mjs    # 30/30 ok
+node tests/client-smoke.mjs  # 107/107 ok（新增剪影/横屏剪影/mask/SF Pro 断言）
+node tests/bridge-unit.mjs   # 27/27 ok
+```
+
+### 19.4 未验证项（阶段 11）
+
+1. 实际渲染下四角是否完全不露白、剪影边缘是否与金属 AED 边贴合（已用素材级合成验证：矩形页面
+   被剪影裁切后四角干净）；
+2. 横屏剪影方向、深色主题下投影观感；
+3. 若需要「完全官方」的状态栏图标：SF Symbols 资源不能随公共仓库分发；如用户从 Apple 设计资源
+   导出官方 SVG，可直接替换构建里的三个图标路径。
+4. 仅 client.js 变更：刷新 GUI 即可。
+
+---
+
+## 20. 阶段 12（顶栏重排：左品牌、右网址与按钮）
+
+> 触发：用户截图指出顶栏排列混乱（图标与名称上下堆叠、副标签夹在中间、网址/按钮不在右侧边界）。
+
+### 20.1 原因
+
+`.brand` 从上游 `.sidebar-brand` 移出后，`sidebar-brand .brand` 的 `display:flex` 不再命中，
+`.brand-mark`（`display:grid`）是块级，名称被挤到下一行；同时 `.brand-sub`（H5 预览）与
+`.preview-meta` 都在 spacer 左边。
+
+### 20.2 修复
+
+- `.ph-brand .brand { display:flex; flex-direction:row; nowrap; }`，图标 + 「Pocket」同一行；
+- `.brand-sub` 隐藏（不再需要副标签）；
+- 头部结构：`brand` → `spacer` → `.ph-right`（`.preview-meta` + `.ph-actions`），
+  `.ph-right { margin-left:auto; justify-content:flex-end }`；网址、示例/登录桥/诊断、状态、
+  刷新/在系统浏览器打开全部贴右边界；
+- 1180/1080/920px 断点依次压缩网址宽度，920px 以下隐藏网址。
+
+### 20.3 验证
+
+```text
+node build-client.mjs        # 幂等；client.js 323,639 B（sha256 905223de…）
+node --check client.js       # ok
+node tests/host-smoke.mjs    # 30/30 ok
+node tests/client-smoke.mjs  # 110/110 ok（新增右组/品牌同行/副标签隐藏断言）
+node tests/bridge-unit.mjs   # 27/27 ok
+```

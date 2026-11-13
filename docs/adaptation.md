@@ -54,6 +54,9 @@
   `index.js` 代码与桌面端协议实现，未在本会话做桌面窗口内的视觉验证。
 - **新增一项上游没有的能力：手机扫码**（见 §9）。地址栏右侧二维码按钮 → 把当前预览地址渲染成
   离线二维码 → 手机扫码打开；编码器内置于 bundle，不联网、不新增依赖。
+- **新增一项上游没有的能力：登录桥**（见 §14）。Host 起一个只监听 `127.0.0.1` 的反向代理，
+  把 Safari 里已登录的 Cookie（或手动粘贴的 Cookie 头）注入上游请求，iframe 改走代理；
+  需要登录、或原本禁止 iframe 嵌入的页面都能在面板里预览。Cookie 只在 Host 内存，停止/失焦/闲置即释放。
 - **新增一项上游没有的能力：预览诊断**（见 §13）。Host 半新增
   `GET /pocket-h5/probe.json`：受控地请求目标地址（只读响应头、最多 5 次跳转、6 秒超时），
   面板据此区分「站点禁止 iframe 嵌入」「被重定向到登录页 / 401」「服务访问不到」，并给出建议。
@@ -175,7 +178,9 @@ Shadow DOM（`attachShadow({ mode: 'open' })`）把整份 CSS 和整棵标记关
 
 - 隔离是单向的：shadow 内样式不外泄，但**可继承属性**（`font-family`、`color` 等）仍会从宿主
   继承进来；上游 `:root → :host` 重新声明了字体与颜色，实际会覆盖。
-- **宿主主题 token 不会自动生效**：面板自带上游黑白灰配色，这是已知限制（见 §10）。
+- **宿主主题 token 的映射**：外观层（§15）把上游变量名映射到 `light-dark()` 面层令牌，
+  并用继承的 `color-scheme` 跟随 DSH 浅色/黑暗主题；上游 CSS 本身仍保持黑白灰硬编码，
+  由外观层覆盖具体选择器。
 - 事件不穿透（`composed` 事件除外）：上游的 `document.addEventListener('keydown')` 转换后
   监听的是 ShadowRoot；焦点在预览 iframe 内时父文档收不到键盘事件（上游同样如此）。
 - `position: fixed` 在 shadow 内仍相对浏览器视口，所以 toast/遮罩必须改 `absolute`。
@@ -325,7 +330,7 @@ DSH Web GUI（宿主页面）
    `resize` / `pocketdisplaychange` / `pocketproxyresult` 等 window 监听器、toast 与
    loading 定时器、`ResizeObserver`，都在卸载时移除/断开。
 
-3. **系统浏览器登录态无法继承；上游的「应用内弹窗登录」也没有了。**
+3. **系统浏览器登录态无法通过浏览器 API 继承；上游的「应用内弹窗登录」也没有了。**
    面板不能读取 Safari/Chrome 的 Cookie（跨应用 + 系统钥匙串加密），也不应该去读。
    内嵌预览用的是 DSH 应用自己的 Chromium 会话：**在预览里登录一次会保留**（含重启 DSH）。
    但上游 Electron 版能让预览里的 `window.open` 在**同一会话的子窗口**里完成登录并把 Cookie
@@ -393,9 +398,8 @@ DSH Web GUI（宿主页面）
 
 - **界面文案仍是上游中文**，没有接入 DSH 的 locale 体系；品牌、帮助弹窗、示例页
   （「留白」）都是上游原样内容。
-- **工作台自带黑白灰浅色配色，不随宿主深浅色切换**。上游 CSS 颜色全部硬编码、
-  `color-scheme` 固定为 light；面板刻意保持上游视觉，不做主题映射（要做就得改 CSS，
-  与「不重写视觉层」冲突）。
+- **外观层覆盖上游配色**：工作台现在跟随 DSH 主题自动明暗切换（`light-dark()` 令牌），
+  但设备外框/状态栏等「被预览的手机」保持中性灰，不参与主题映射。
 - **目标 H5 若设置 `X-Frame-Options` / CSP `frame-ancestors`，预览会空白**。
   工具不修改也不绕过响应头；解决办法是在你自己的开发服务里允许被嵌入，
   或先用「在系统浏览器打开」确认 H5 服务本身可访问。面板里的「诊断」会直接把这条原因标出来。
@@ -547,3 +551,161 @@ DSH Web GUI 左侧栏 →「Pocket H5」图标 → 主区域显示面板。首�
 - 「在系统浏览器打开」按钮（上游「新窗口打开」改名，`title`/`aria-label` 同步）+
   帮助弹窗新增「需要登录的页面」说明；
 - 构建期约束：不新增 `require`、样式只进 Shadow DOM、卸载时移除按钮/对话框。
+
+## 14. 登录桥（阶段 6 新增）
+
+### 14.1 为什么需要它
+
+内嵌 iframe 跑在 DSH 自己的 Chromium 会话里，没有 Safari/Chrome 的登录 Cookie；而浏览器不允许
+一个页面读取另一个应用的 Cookie。于是「需要登录才能看」的页面在面板里只能看到登录页或空白。
+登录桥把两件事拆开：**读登录态**（本机文件/手动粘贴）和**用登录态**（本机反向代理注入 Cookie），
+从而在不改 DSH、不改浏览器安全模型的前提下，让面板里的预览带上登录态。
+
+### 14.2 结构
+
+- `lib/bridge.js`（Host，纯 Node 内置模块）：
+  - `parseBinaryCookies(buffer)`：Safari `Cookies.binarycookies` 解析（自动识别真实布局与规范布局，
+    校验越界/NUL/UTF-8；expires 从 Cocoa 2001 基准换算为 Unix 秒，0=session）；
+  - `readSafariCookies({path})`：只读 Safari Cookie 文件；EACCES/EPERM →
+    `{ok:false, code:'safari-permission', message:…完全磁盘访问权限…}`；
+  - `filterCookiesForUrl(cookies, url)`：域边界后缀匹配 + path 前缀 + 过期过滤（IP 仅精确匹配）；
+  - `mergeCookieHeader(jar, browserCookieHeader)`：jar 优先，浏览器独有名字保留；
+  - `createBridge({target, cookies, timeoutMs})`：只绑 `127.0.0.1:0`、只连 target origin；注入 Cookie、
+    剥离 `X-Frame-Options`、删除 CSP 的 `frame-ancestors` 指令、改写 `Location`/请求 `origin`/`referer`、
+    把上游 `Set-Cookie` 去掉 `Domain`/`SameSite=None` 后转给浏览器并回灌 jar、body 流式透传、
+    `upgrade` 用 net/tls 隧道转发 WebSocket（注入 Cookie）、502/504 纯文本、幂等 `close()`、
+    live `cookieCount`；无磁盘写入、无日志。
+- `index.js` 路由 `prefix /pocket-h5` 内新增 `GET|POST /pocket-h5/bridge.json`：
+  - GET 返回 `{ok, active, target, entryUrl, proxyUrl, cookieCount, source, importedAt}`（不含 Cookie 值）；
+  - POST `{action:'start'|'refresh'|'stop', target?, cookies?}`：start 默认读 Safari 并过滤，
+    传 `cookies` 则用手动 Cookie 头；refresh 重新读 Safari；stop 关闭代理。
+  - 单一活动桥、闲置 30 分钟自动关闭；插件卸载 disposer 里关闭。
+- `src/client/bridge.js`：「登录桥」按钮 + 对话框（来源、状态、手动粘贴 Cookie 折叠区）+ 顶部
+  「登录桥已启用」状态条 + 「恢复直连」；启用时设置 `window.pocketBridge = {target, entryUrl}`，
+  `navigate()` 对目标地址改加载代理地址（构建期 patch），二维码/诊断/桥接本身都用
+  `pocketPreviewTarget()` 还原成原始目标。
+- 生命周期：面板卸载时停止桥接；`Cookie` 只在 Host 进程内存。
+
+### 14.3 安全与隐私
+
+- 代理只监听回环、只代理启动时指定的 origin（非开放代理）；Cookie 值不写盘、不打印、不出现在
+  bridge.json 状态里。
+- 读取 Safari Cookie 需要用户在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」给 DSH 授权并重启；
+  未授权时返回明确错误并提供「手动粘贴 Cookie」路径。
+- 手动 Cookie 只存在内存，停止/闲置即清空。
+
+### 14.4 已知限制
+
+- 只对 Cookie 认证有效；Bearer/localStorage 登录态不会自动带入。
+- 只代理 target origin：页面里写死指向其它域名（CDN/API）的绝对地址不经过代理，这些请求没有登录态。
+- 面板预览的 origin 变成 `http://127.0.0.1:<代理端口>`：依赖精确 origin/referer 校验的页面需验证；
+  代理已改写请求 origin/referer 与响应 Location 以尽量兼容。
+- 代理剥离 `X-Frame-Options`/`frame-ancestors` 是为了「能在面板里看」，不代表目标站愿意被嵌入；
+  仅用于本机自测。
+
+## 15. 外观层：FlowPilot 风格重排 + 黑暗模式（阶段 7 新增）
+
+### 15.1 目标
+
+上游工作台是「整页表单」的排版（11–12.5px 密排、每节一条描边、没有顶栏），放进 1000px 宽的面板里
+显得拥挤；用户要求按 FlowPilot 的设计语言重排，并且界面要有黑暗模式。
+
+### 15.2 做法（不重写业务逻辑）
+
+- **DOM 重排**（`src/client/theme.js` 的 `mountPanelTheme`）：在上游 DOM 已挂载、app.js 已完成
+  事件绑定之后，创建 `<header class="ph-topbar">` 作为 `.workspace` 的第一个 grid 子项，
+  把 `.brand` / `.brand-sub` / `.preview-meta` / `#loadStatus` / `#refreshButton` / `#externalButton`
+  移动进去；`#previewName`、示例、二维码、诊断、登录桥按钮随 `.preview-meta` 一起在顶栏。
+  **所有 id 与监听器不变**；卸载时只移除 header。
+- **布局**：`.workspace.ph-workspace` → `grid-template-columns: 300px 1fr; grid-template-rows: 48px 1fr`；
+  左栏是「一区一卡」的卡片栈（每张 surface 卡片 12px 圆角 + 极轻阴影，卡片之间用 8px 间距分隔，
+  没有任何横向分割线；折叠项是卡内 `--p-surface-2` 下沉小面板），右栏是画布卡片（1px 边界 + 点阵底）。
+  侧栏页脚（帮助/开发者工具/引擎信息/自动保存/重置/说明）由 `mountPanelTheme` 收进一张独立卡片。
+- **视觉令牌**：`.pocket-h5-root` 定义 `--p-surface / --p-surface-2 / --p-surface-3 / --p-hover /
+  --p-border / --p-text / --p-brand / --p-mask / --p-shadow-*`，全部**成对**写成
+  `light-dark(浅色, 深色)`，并把上游 `--surface / --ink / --line / ...` 映射到这些令牌，
+  让上游大量使用变量的规则自动获得暗色。
+- **暗色来源**：不读 JS 主题服务、不做开关；`light-dark()` 跟随元素继承的 `color-scheme`，
+  DSH 的 theme presenter 本来就会在 `<html>` 上设置它，Shadow DOM 内继承即可自动切换。
+  构建期已移除此前 `:host { color-scheme: light }` 的强制浅色。
+- **覆盖范围**：侧栏卡片/控件/开关/分段/滑杆、卡内折叠面板、画布点阵、对话框/帮助/toast、
+  二维码/诊断/登录桥对话框细节色、滚动条、窄窗口断点（1080/860px）。
+- **去横线**：分区之间不画 `border`/`::before` 分隔线，全部靠「卡片面层 + 间距」区分；
+  卡内折叠项用下沉面层而不是虚线。
+
+### 15.3 设备边框素材（用户提供的 iPhone 外框）
+
+上游用 CSS 手绘手机外框（渐变边框 + 侧键 + 圆角屏幕）。现在改成用户提供的一张 iPhone 外框图片：
+
+- 素材：`src/client/assets/bezel.webp`（62 KiB，1318×2717）。原始图 1318×2718、屏幕开口为
+  1206×2622 的浅色区域（正好 402×874 @3x）；`tools/prepare-bezel.py` 把开口（含灵动岛）抠成透明、
+  裁到外框 bbox、压成 WebP，并在 `bezel.json` 记录像素/逻辑几何（逻辑 = 像素 ÷ 3）。
+- 几何：portrait 外框 439.333×905.667 逻辑 px，屏幕开口在 (18.667, 16.0)，右下留边 18.667/15.667；
+  圆角取图片开口半径 270 px ÷ 3 = 90。landscape 是同一张图旋转 -90° 后的几何。
+- 构建期做了两处 app.js 机械替换：
+  1. `device` 的 `bodyWidthMm/bodyHeightMm` 由边框比例换算（72.777 / 150.032 mm，保证屏幕仍是
+     402×874 逻辑 px、66.6×144.8 mm 真机屏幕尺寸）；
+  2. `resizeDevice` 里原来「上下左右等边距」的 `padding` 改成按 `POCKET_BEZEL.portrait/landscape`
+     的屏幕开口几何逐边定位（图片上下留边不对称）。
+- 外观层：`.phone` 只保留布局盒，`::before` 画边框素材（横屏时 `rotate(-90deg)`），
+  `.side-key` 隐藏；`.screen` 的圆角改为素材开口半径、去掉上游手绘的 5/6px 描边环。
+- 素材只由 `tools/prepare-bezel.py` 生成，构建脚本会校验屏幕开口必须是 402×874 并把图片内联进
+  `client.js`（不额外发请求）。
+
+### 15.4 边框改为「盖板」+ iOS 标准控件（阶段 9 补充）
+
+- **圆角由边框素材裁切，页面保持矩形**：`.screen` 的 `border-radius` 改为 `0`，边框图片的 `::before`
+  叠在 `.screen` **上方**（`z-index: 5`）。页面四角被素材里不透明的内框/圆角盖住，
+  不再用 CSS 圆角去拟合 squircle（原先两者不匹配，四角会露出白色或吃掉边框）。
+- **iOS 状态栏**：状态栏 62pt 高、内容垂直居中、时间左内边距 54 / 右侧图标组右内边距 26；
+  时间 17pt/600/等宽数字；信号 18×12（4 根圆角柱）、Wi‑Fi 17×12（3 段弧 + 点）、
+  电池 27×13（25 体内宽 21 + 2 尖端，百分比在体内）。构建期替换了 `ui/index.html` 的状态栏标记，
+  保留 `#batteryFill`/`#batteryText` 供 app.js 写入。
+- **底部手势条**：134×5、圆角 2.5、距底 8pt（横屏 180×5、距底 7pt）。
+- app.js 的电池填充宽度由 `24 * level` 改为 `21 * level`（iOS 电池体内宽）。
+
+### 15.5 边框剪影裁切（阶段 11 补充）
+
+矩形页面放在圆角外框下时，页面矩形的**包围盒四角会伸出手机外轮廓**（外框圆角比屏幕开口的
+包围盒更靠内），表现为左上/右上角露白。修法：
+
+- 从边框素材的 alpha 生成**机身剪影** `bezel-mask.webp`（把屏幕开口填实），旋转 90° 得到横屏版；
+- `.phone` 用 `mask-image` + `mask-size: 100% 100%` 把整棵子树（页面 + 边框）裁到剪影内；
+  页面仍是矩形，但只在手机外轮廓内可见，四角由外框圆角自然裁切；
+- 投影从边框伪元素移到 `.device-slot` 的 `filter: drop-shadow(...)`，否则会被剪影裁掉；
+- 剪影两张合计约 2.5 KiB，构建期内联。
+
+### 15.6 顶栏重排（阶段 12 补充）
+
+截图里的顶栏有两个问题：`.brand` 从 `.sidebar-brand` 移出后失去了 `display:flex`，里面的
+`.brand-mark`（`display:grid`，块级）把名称挤到下一行；「H5 预览」副标签也混在品牌和网址之间。
+
+- `.ph-brand .brand` 强制 `display:flex; flex-direction:row; nowrap`，图标 + 名称同一行；
+- 隐藏多余副标签 `.brand-sub`；
+- 头部改成「品牌 → spacer → 右组」：右组 `.ph-right` 内依次放 `.preview-meta`（网址 +
+  示例/登录桥/诊断按钮）与 `.ph-actions`（状态胶囊 + 刷新/在系统浏览器打开），
+  `margin-left:auto` 保证整组贴着右边界；
+- 窄窗口断点：1180/1080/920px 依次收缩网址宽度，920px 以下隐藏网址只留状态与动作。
+
+### 15.7 说明文字收进 ? 提示（阶段 10 补充）
+
+原则：*Avoid unnecessary secondary labels and descriptions. Let the layout do the explaining.*
+
+- 隐藏 `.settings-section .setting-hint` 与 `.sidebar-note`（静态说明、校准提示、布局提示、模拟器说明）；
+- 每个分区标题/折叠项摘要旁加一个 15px 圆形 `?`（`.ph-help`，`cursor: help`）；
+  hover / focus 出现 `.ph-tip` 浮层，点击可固定，Esc / 滚动 / 失焦关闭；
+- 浮层内容 = 固定说明 +（可选）实时状态：`data-tip-from="#calibrationStatus"`、`#layoutHint`；
+- 8 个提示点：预览地址、显示与尺寸、模拟设备、系统外观、页面布局、SOCKS5、校准、页脚（外观保存/说明）；
+- 放在 `<summary>` 内的 `?` 会 `preventDefault + stopPropagation`，不会触发展开/收起；
+- 工具提示用 `position: fixed` 渲染，避免被侧栏滚动容器裁切。
+
+### 15.6 已知限制 / 注意
+
+- 设备外框、屏幕边框、状态栏、灵动岛、手势条**不参与**主题映射（保持中性灰/用户设置色），
+  这样黑暗模式下手机依然是「手机」而不是一块深色矩形。
+- `light-dark()` 需要宿主设置 `color-scheme`；在 DSH 之外的浏览器页面打开时默认浅色。
+- 顶栏动作在 `≤860px` 时隐藏「当前页面」区（只保留品牌 + 状态 + 动作），避免挤压。
+- 外观层只改样式与节点位置；`ui/` 快照仍与上游逐字节一致，app.js 的两处几何替换在构建期完成。
+- 设备外框图片比 iPhone 17 官方机身略厚：`显示约` 会显示约 72.8×150.0 mm（屏幕仍严格对应
+  402×874 逻辑 px / 66.6×144.8 mm 真机屏幕）；如果想让机身数字对齐官方规格，需要换一张更薄的
+  外框图，或改 `device` 的毫米数（会让屏幕物理尺寸略小于真机）。

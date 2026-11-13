@@ -120,6 +120,28 @@ function buildMarkup(html) {
   if (!body.includes(proxyHintBefore)) fail('代理提示文案（' + proxyHintBefore + '）未找到')
   body = body.split(proxyHintBefore).join(PANEL_PROXY_HINT)
 
+  // 状态栏按 Apple 标准几何重画（时间 17pt/600，信号 18x12、Wi-Fi 17x12、电池 27x13），
+  // 同时保留 app.js 依赖的 #batteryFill / #batteryText 与类名。
+  const statusBarStart = body.indexOf('<div id="statusBar"')
+  const islandStart = body.indexOf('<div id="island"')
+  if (statusBarStart < 0 || islandStart < statusBarStart) fail('状态栏标记未找到')
+  {
+    const statusBar =
+      '<div id="statusBar" class="status-bar">' +
+      '<span class="status-time">9:41</span>' +
+      '<div class="status-right">' +
+      '<svg class="signal" viewBox="0 0 18 12" aria-label="信号"><rect x="0" y="7.6" width="3" height="4.4" rx="1"/>' +
+      '<rect x="5" y="5.1" width="3" height="6.9" rx="1"/><rect x="10" y="2.6" width="3" height="9.4" rx="1"/>' +
+      '<rect x="15" y="0" width="3" height="12" rx="1"/></svg>' +
+      '<svg class="wifi" viewBox="0 0 17 12" aria-label="Wi-Fi"><path d="M1.3 3.9a10.9 10.9 0 0 1 14.4 0"/>' +
+      '<path d="M4 6.7a7 7 0 0 1 9 0"/><path d="M6.7 9.5a3.1 3.1 0 0 1 3.6 0"/>' +
+      '<circle cx="8.5" cy="11.4" r="1.05"/></svg>' +
+      '<span class="battery"><span id="batteryFill" class="battery-fill"></span>' +
+      '<span id="batteryText">100</span></span>' +
+      '</div></div>\n            '
+    body = body.slice(0, statusBarStart) + statusBar + body.slice(islandStart)
+  }
+
   // 「新窗口打开」在 DSH 桌面端实际由 shell.openExternal 交给系统默认浏览器，
   // 用的是系统浏览器的登录态；把入口文案写准（title 与 aria-label 同文）。
   const externalLabelBefore = '在新窗口打开 H5'
@@ -160,7 +182,7 @@ function buildCss(source) {
   }
 
   replaceAll(':root {', ':host {')
-  replaceAll(':host {\n  font-family:', ':host {\n  color-scheme: light;\n  font-family:')
+  // 不再强制 light：面板用 light-dark() 跟随宿主的 color-scheme（黑暗模式）。
   replaceAll(
     'body { margin: 0; overflow: hidden; }',
     ':host {\n  display: block;\n  height: 100%;\n  margin: 0;\n  overflow: hidden;\n}',
@@ -201,7 +223,7 @@ function buildCss(source) {
  * 3. 逻辑：上游 app.js
  * ------------------------------------------------------------------ */
 
-function buildApp(source) {
+function buildApp(source, bezel) {
   let code = source
 
   const bridgeStart = code.indexOf('if (window.pocketDesktop) {')
@@ -244,11 +266,44 @@ function buildApp(source) {
   if (!code.includes(queryLine)) fail('app.js 的 ?url= 读取行未找到')
   code = code.split(queryLine).join('const requested = saved.url;')
 
+  // 登录桥启用时，navigate 仍记录原始目标地址，但实际加载代理地址；
+  // 这样刷新按钮、示例按钮、地址栏语义都保持「目标地址」。
+  const frameSrcLine = "$('previewFrame').src = url;"
+  if (count(code, frameSrcLine) !== 1) fail('app.js 的 iframe src 赋值行数量异常：' + count(code, frameSrcLine))
+  code = code.split(frameSrcLine).join(
+    "const bridged = window.pocketBridge && window.pocketBridge.target === url ? window.pocketBridge.entryUrl : null;\n  $('previewFrame').src = bridged || url;",
+  )
+
+  // 设备外框：把上游「按机身毫米数推导外框」改成「按边框图片的屏幕开口 + 留边」。
+  // 逻辑像素到毫米的换算不变（460 PPI / @3x），只是机身尺寸由边框素材比例决定。
+  const mmPerLogicalPx = (bezel.logical.pixelRatio * 25.4) / bezel.logical.ppi
+  const bodyWidthMm = (bezel.logical.portrait.outerW * mmPerLogicalPx).toFixed(6)
+  const bodyHeightMm = (bezel.logical.portrait.outerH * mmPerLogicalPx).toFixed(6)
+  const deviceLine = 'const device = { ppi: 460, pixelRatio: 3, bodyWidthMm: 71.5, bodyHeightMm: 149.6 };'
+  if (!code.includes(deviceLine)) fail('app.js 的 device 常量行未找到')
+  code = code.split(deviceLine).join(
+    'const device = { ppi: 460, pixelRatio: 3, bodyWidthMm: ' + bodyWidthMm + ', bodyHeightMm: ' + bodyHeightMm + ' }; // 外框尺寸来自 src/client/assets/bezel.json',
+  )
+
+  const batteryFillLine = "$('batteryFill').style.width = `${24 * state.battery / 100}px`;"
+  if (!code.includes(batteryFillLine)) fail('app.js 的电池填充宽度行未找到')
+  code = code.split(batteryFillLine).join("$('batteryFill').style.width = `${21 * state.battery / 100}px`;")
+
+  const paddingLine = "$('phone').style.padding = `${(outerHeight - height) / 2 - 1}px ${(outerWidth - width) / 2 - 1}px`;";
+  if (!code.includes(paddingLine)) fail('app.js 的外框 padding 行未找到')
+  const paddingReplacement = [
+    "const bezel = state.landscape ? POCKET_BEZEL.landscape : POCKET_BEZEL.portrait;",
+    '  // 屏幕开口在边框图片里上下留边不对称，按素材几何定位 .screen',
+    "  $('phone').style.padding = `${bezel.screenY}px ${bezel.outerW - bezel.screenX - bezel.screenW}px ${bezel.outerH - bezel.screenY - bezel.screenH}px ${bezel.screenX}px`;",
+  ].join('\n')
+  code = code.split(paddingLine).join(paddingReplacement)
+
   const createElementCount = count(code, 'document.createElement(')
   if (createElementCount !== 1) fail('document.createElement 出现 ' + createElementCount + ' 次（预期 1 次，用于 datalist option）')
   code = code.split('document.createElement(').join('realDocument.createElement(')
 
   if (code.includes('pocketDesktop.reload')) fail('仍残留 pocketDesktop.reload')
+  if (!code.includes('POCKET_BEZEL.portrait')) fail('app.js 没有按边框几何定位屏幕')
   return code
 }
 
@@ -288,10 +343,28 @@ const appSource = await read('ui/app.js')
 const panelSource = await read('src/client/panel.js')
 const qrSource = await read('src/client/qr.js')
 const diagnoseSource = await read('src/client/diagnose.js')
+const bridgeSource = await read('src/client/bridge.js')
+const themeSource = await read('src/client/theme.js')
+
+/* 设备边框素材：用户提供的 iPhone 外框（屏幕开口已抠空），几何见 assets/README.md */
+const bezelImageBytes = await readFile(join(root, 'src/client/assets/bezel.webp'))
+const bezelMaskBytes = await readFile(join(root, 'src/client/assets/bezel-mask.webp'))
+const bezelMaskLandscapeBytes = await readFile(join(root, 'src/client/assets/bezel-mask-landscape.webp'))
+const bezelMetrics = JSON.parse(await read('src/client/assets/bezel.json'))
+if (bezelImageBytes.length > 200 * 1024) fail('边框素材过大：' + bezelImageBytes.length + ' 字节（应小于 200 KiB）')
+if (bezelMetrics?.logical?.portrait?.screenW !== 402 || bezelMetrics?.logical?.portrait?.screenH !== 874) {
+  fail('边框几何异常：屏幕开口应是 402x874 逻辑像素')
+}
+if (bezelMaskBytes.length > 20 * 1024 || bezelMaskLandscapeBytes.length > 20 * 1024) {
+  fail('机身剪影素材过大：' + bezelMaskBytes.length + '/' + bezelMaskLandscapeBytes.length + ' 字节')
+}
+ok('边框素材 ' + (bezelImageBytes.length / 1024).toFixed(1) + ' KiB · ' +
+  bezelMetrics.image.width + 'x' + bezelMetrics.image.height + '（屏幕 ' +
+  bezelMetrics.image.screen.width + 'x' + bezelMetrics.image.screen.height + ' 已抠空）')
 
 const markup = buildMarkup(html)
 const css = buildCss(cssSource)
-const appCode = buildApp(appSource)
+const appCode = buildApp(appSource, bezelMetrics)
 
 const appIds = new Set([...appCode.matchAll(/\$\('([A-Za-z0-9_-]+)'\)/g)].map((match) => match[1]))
 const markupIds = new Set([...markup.matchAll(/\bid="([A-Za-z0-9_-]+)"/g)].map((match) => match[1]))
@@ -309,10 +382,21 @@ if (!qrSource.includes('function mountQrFeature')) fail('qr.js 缺少 mountQrFea
 if (!qrSource.includes('createQrMatrix')) fail('qr.js 没有使用打包的二维码内核')
 if (!panelSource.includes('applyHostDisplayMetrics')) fail('面板片段没有接 Host 的显示器物理尺寸')
 if (!panelSource.includes('mountDiagnoseFeature(shadow)')) fail('面板片段没有挂载诊断入口')
-if (!panelSource.includes('CSS + QR_CSS + DIAGNOSIS_CSS')) fail('面板片段没有注入诊断样式')
+if (!panelSource.includes('CSS + QR_CSS + DIAGNOSIS_CSS + BRIDGE_CSS + PANEL_THEME_CSS')) fail('面板片段没有注入外观层样式')
+if (!panelSource.includes('mountPanelTheme(shadow)')) fail('面板片段没有挂载外观层')
+if (!themeSource.includes('function mountPanelTheme')) fail('theme.js 缺少 mountPanelTheme')
+if (!themeSource.includes('light-dark(')) fail('theme.js 没有 light-dark() 黑暗模式配色')
+if (!themeSource.includes('--p-bezel-image')) fail('theme.js 没有使用设备边框素材')
+if (!panelSource.includes('mountBridgeFeature(shadow)')) fail('面板片段没有挂载登录桥')
+if (!panelSource.includes('function pocketPreviewTarget')) fail('面板片段缺少登录桥目标解析')
+if (!bridgeSource.includes('function mountBridgeFeature')) fail('bridge.js 缺少 mountBridgeFeature')
+if (!bridgeSource.includes('function bridgeBannerText')) fail('bridge.js 缺少 bridgeBannerText')
 if (!diagnoseSource.includes('function summarizeProbe')) fail('diagnose.js 缺少 summarizeProbe')
 if (markup.includes('在新窗口打开 H5')) fail('「在新窗口打开」文案未替换')
 if (!markup.includes('需要登录的页面')) fail('帮助弹窗缺少登录说明')
+if (!markup.includes('class="status-time"')) fail('状态栏没有使用标准时间标记')
+if (!markup.includes('viewBox="0 0 18 12"')) fail('状态栏信号图标没有替换')
+if (!appCode.includes('21 * state.battery')) fail('电池填充宽度没有按 iOS 电池内宽调整')
 
 /* ------------------------------------------------------------------ *
  * 4. 内置二维码编码器：vendor/qrcode（node-qrcode 1.5.4 内核，MIT）
@@ -380,6 +464,17 @@ const qrRuntime = [
   '',
 ].join('\n')
 
+const bezelImageUrl = 'data:image/webp;base64,' + bezelImageBytes.toString('base64')
+const bezelRuntime = [
+  '    /* ---- 设备边框（用户提供的 iPhone 外框；屏幕开口已抠空，几何见 src/client/assets/README.md） ---- */',
+  '    const POCKET_BEZEL_IMAGE = ' + JSON.stringify(bezelImageUrl) + ';',
+  '    const POCKET_BEZEL = ' + JSON.stringify(bezelMetrics.logical) + ';',
+  '    // 机身剪影：矩形页面按这个 alpha 裁切，圆角处不会露出页面边角',
+  '    const POCKET_BEZEL_MASK = ' + JSON.stringify('data:image/webp;base64,' + bezelMaskBytes.toString('base64')) + ';',
+  '    const POCKET_BEZEL_MASK_LANDSCAPE = ' + JSON.stringify('data:image/webp;base64,' + bezelMaskLandscapeBytes.toString('base64')) + ';',
+  '',
+].join('\n')
+
 const bundle = [
   '/* ------------------------------------------------------------------',
   ' * Pocket H5 · DSH 面板 client bundle —— 由 build-client.mjs 生成，不要手改。',
@@ -400,6 +495,8 @@ const bundle = [
   '',
   '',
   qrRuntime,
+  '',
+  bezelRuntime,
   '    /* ---- 上游 app.js（Electron 桥替换为面板宿主适配） ---- */',
   '    function mountPocketH5(root, DEMO_URL) {',
   '      const realDocument = globalThis.document;',
@@ -442,6 +539,10 @@ const bundle = [
   '',
   indent(diagnoseSource, 4),
   '',
+  indent(bridgeSource, 4),
+  '',
+  indent(themeSource, 4),
+  '',
   indent(panelSource, 4),
   '',
   '    return {',
@@ -449,13 +550,17 @@ const bundle = [
   '      apply: pocketApply,',
   '      version: POCKET_H5_VERSION,',
   '      // 离线冒烟测试入口（tests/client-smoke.mjs 使用；渲染不读取）。',
-  '      __test: { createQrMatrix: createQrMatrix, qrSvgMarkup: qrSvgMarkup, pickHostDisplay: pickHostDisplay, hostCssPixelsPerInch: hostCssPixelsPerInch, summarizeProbe: summarizeProbe },',
+  '      __test: { createQrMatrix: createQrMatrix, qrSvgMarkup: qrSvgMarkup, pickHostDisplay: pickHostDisplay, hostCssPixelsPerInch: hostCssPixelsPerInch, summarizeProbe: summarizeProbe, bridgeBannerText: bridgeBannerText, bridgeCanTarget: bridgeCanTarget, bezelMetrics: POCKET_BEZEL },',
   '    };',
   '  },',
   '});',
   '',
 ].join('\n')
 
+if (!bundle.includes('data:image/webp;base64,')) fail('client bundle 没有内联设备边框素材')
+if (!bundle.includes('const POCKET_BEZEL =')) fail('client bundle 没有注入边框几何')
+if (!bundle.includes('const POCKET_BEZEL_MASK =')) fail('client bundle 没有注入机身剪影')
+if (!bundle.includes('const POCKET_BEZEL_MASK_LANDSCAPE =')) fail('client bundle 没有注入横屏机身剪影')
 if (failures.length > 0) {
   console.error(`\n[build] 失败：${failures.length} 个转换/校验问题，未写出 client.js。`)
   process.exit(1)

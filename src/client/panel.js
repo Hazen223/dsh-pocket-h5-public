@@ -100,6 +100,20 @@ function watchHostDisplayMetrics() {
   }
 }
 
+/**
+ * 当前预览的「真实目标地址」。
+ * 登录桥启用时 iframe 实际加载的是代理地址（`window.pocketBridge.entryUrl`），
+ * 二维码、诊断、登录桥本身都应该针对原始目标，而不是代理地址。
+ * @param {ShadowRoot} shadow
+ */
+function pocketPreviewTarget(shadow) {
+  const frame = shadow.getElementById('previewFrame')
+  const src = frame && frame.getAttribute('src') ? frame.getAttribute('src') : ''
+  const bridge = window.pocketBridge
+  if (bridge && src === bridge.entryUrl) return bridge.target
+  return src
+}
+
 /** demo 页面由 Host 半注册在 /pocket-h5/demo.html（同源，避免 data: 与跨域策略）。 */
 function pocketDemoUrl() {
   try {
@@ -122,24 +136,30 @@ function PocketH5Panel() {
 
     const style = document.createElement('style')
     style.setAttribute('data-pocket-h5-style', '')
-    style.textContent = CSS + QR_CSS + DIAGNOSIS_CSS
+    style.textContent = CSS + QR_CSS + DIAGNOSIS_CSS + BRIDGE_CSS + PANEL_THEME_CSS
     const root = document.createElement('div')
     root.className = 'pocket-h5-root'
     root.innerHTML = MARKUP
     shadow.append(style, root)
 
     let dispose = null
+    let disposeTheme = null
     let disposeQr = null
     let disposeDiagnose = null
+    let disposeBridge = null
     let disposeDisplay = null
     try {
       dispose = mountPocketH5(shadow, pocketDemoUrl())
+      // 外观层：把品牌/当前页面/状态/动作移到 48px 顶栏，并套上 FlowPilot 风格面层。
+      disposeTheme = mountPanelTheme(shadow)
       // Host 能读到真实显示器毫米尺寸时，100% 就是真机大小；失败保持浏览器估算。
       disposeDisplay = watchHostDisplayMetrics()
       // 上游工作台之外新增的「手机扫码」入口；失败不影响预览本身。
       disposeQr = mountQrFeature(shadow)
       // 「诊断」入口：解释页面为什么打不开（禁止嵌入 / 需要登录）。
       disposeDiagnose = mountDiagnoseFeature(shadow)
+      // 「登录桥」入口：用 Safari 已登录 Cookie 经本机代理预览。
+      disposeBridge = mountBridgeFeature(shadow)
     } catch (error) {
       console.error('[pocket-h5] 工作台初始化失败', error)
     }
@@ -158,6 +178,16 @@ function PocketH5Panel() {
         if (typeof disposeDiagnose === 'function') disposeDiagnose()
       } catch (error) {
         console.error('[pocket-h5] 诊断入口清理失败', error)
+      }
+      try {
+        if (typeof disposeBridge === 'function') disposeBridge()
+      } catch (error) {
+        console.error('[pocket-h5] 登录桥清理失败', error)
+      }
+      try {
+        if (typeof disposeTheme === 'function') disposeTheme()
+      } catch (error) {
+        console.error('[pocket-h5] 外观层清理失败', error)
       }
       try {
         if (typeof disposeDisplay === 'function') disposeDisplay()
